@@ -1,15 +1,23 @@
 import asyncio
 import json
 import logging
+import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import date
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 
-from config import CHANGES_JSON_URL, CHANGES_TTL, CHANGES_URL, GROUP
+import chromium_libs
+import http_client
+import mirror
+from config import CHANGES_JSON_URL, CHANGES_PROXY, CHANGES_TTL, CHANGES_URL, CHROMIUM_FORCE_IPV4, GOTO_RETRIES, GOTO_TIMEOUT_MS, GROUP
 from utils import norm, norm_group
 
 logger = logging.getLogger("changes")
@@ -55,13 +63,132 @@ def _cached(key: str, ttl: int, factory):
     return value
 
 
+CHROMIUM_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+_ipv4_cache: dict[str, str | None] = {}
+
+
+def _resolve_ipv4(host: str) -> str | None:
+    if host in _ipv4_cache:
+        return _ipv4_cache[host]
+    try:
+        infos = socket.getaddrinfo(host, 443, socket.AF_INET)
+        ip = infos[0][4][0] if infos else None
+    except OSError:
+        ip = None
+    _ipv4_cache[host] = ip
+    return ip
+
+
+def _playwright_proxy() -> dict | None:
+    if not CHANGES_PROXY:
+        return None
+    parsed = urlparse(CHANGES_PROXY)
+    server = f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
+    proxy: dict = {"server": server}
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+    return proxy
+
+
+def _launch_args() -> list[str]:
+    args = list(CHROMIUM_ARGS)
+    if CHROMIUM_FORCE_IPV4:
+        rules = []
+        for host in ("www.oat.ru", "oat.ru"):
+            ip = _resolve_ipv4(host)
+            if ip:
+                rules.append(f"MAP {host} {ip}")
+        if rules:
+            args.append("--host-resolver-rules=" + ",".join(rules))
+    return args
+
+
+def probe_site(timeout: tuple[float, float] = (10, 25)) -> tuple[bool, str]:
+    """Проверяет доступность oat.ru с этой машины (для диагностики на сервере)."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+    try:
+        infos = socket.getaddrinfo("www.oat.ru", 443)
+        ips = sorted({i[4][0] for i in infos})
+    except OSError as e:
+        return False, f"DNS не разрешился: {e}"
+    try:
+        started = time.monotonic()
+        resp = http_client.get("https://www.oat.ru/timetable/Changes/b1", headers=headers, timeout=timeout)
+        elapsed = time.monotonic() - started
+        ok = resp.status_code == 200
+        return ok, f"DNS={ips}, HTTP {resp.status_code} за {elapsed:.1f}с"
+    except requests.RequestException as e:
+        detail = str(e).split("(")[0][-160:]
+        hint = ""
+        if not CHANGES_PROXY:
+            hint = " | Подсказка: если сайт блокирует IP датацентра — задай CHANGES_PROXY (прокси с российским IP)"
+        return False, f"DNS={ips}, запрос не прошёл: {detail}{hint}"
+
+
+def _try_launch() -> bool:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=_launch_args(), proxy=_playwright_proxy())
+        browser.close()
+    return True
+
+
+def ensure_browser_installed() -> bool:
+    """Готовит Chromium к работе: скачивает браузер и системные библиотеки при необходимости."""
+    chromium_libs.apply_ld_library_path()
+    installed = False
+    for _ in range(3):
+        try:
+            return _try_launch()
+        except Exception as e:
+            message = str(e)
+            if "Executable doesn't exist" in message or "playwright was just installed" in message.lower():
+                if installed:
+                    logger.error("Chromium скачан, но не запускается: %s", message[-500:])
+                    return False
+                logger.info("Chromium не найден — скачиваю (один раз, может занять пару минут)...")
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "playwright", "install", "chromium"],
+                        check=True,
+                    )
+                    installed = True
+                    continue
+                except Exception:
+                    logger.exception("Не удалось скачать Chromium командой playwright install")
+                    return False
+            if "shared libraries" in message or "libnspr4" in message or "libnss3" in message:
+                logger.info("В контейнере нет системных библиотек браузера — скачиваю их без root...")
+                if chromium_libs.ensure_libs():
+                    continue
+                logger.error("Не удалось докачать библиотеки автоматически.")
+                return False
+            logger.exception("Chromium не запускается по неизвестной причине")
+            return False
+    return False
+
+
 async def _render_page(url: str, max_wait: float = 25.0, min_wait: float = 6.0, stability_window: float = 1.5) -> str:
     async with _lock:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=_launch_args(), proxy=_playwright_proxy())
             page = await browser.new_page()
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                last_error: Exception | None = None
+                for attempt in range(1, GOTO_RETRIES + 1):
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+                        last_error = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.warning("Загрузка страницы не удалась (попытка %d/%d): %s", attempt, GOTO_RETRIES, str(e)[-300:])
+                        if attempt < GOTO_RETRIES:
+                            await asyncio.sleep(3)
+                if last_error is not None:
+                    raise last_error
 
                 async def snapshot() -> str:
                     return await page.evaluate(
@@ -194,22 +321,18 @@ def _page_from_json(entry: dict) -> ChangesPage:
 
 
 def _fetch_from_json_source(day: date) -> ChangesPage | None:
-    """Берёт изменения из внешнего JSON (например, обновляемого GitHub Actions).
+    """Берёт изменения из зеркала (changes_data.json, обновляемого GitHub Actions).
 
-    Возвращает None, если источник не настроен (тогда используем Playwright).
-    Если источник настроен, но данных за дату нет — считаем, что изменений нет
+    Возвращает None, если зеркало не настроено (тогда используем Playwright).
+    Если зеркало настроено, но данных за дату нет — считаем, что изменений нет
     (это безопаснее, чем запускать браузер в памяти маленького сервера).
     """
     if not CHANGES_JSON_URL:
         return None
-    try:
-        resp = requests.get(f"{CHANGES_JSON_URL}?t={int(time.time())}", timeout=20)
-        resp.raise_for_status()
-        raw = json.loads(resp.text)
-    except Exception:
-        logger.exception("Не удалось получить JSON изменений из %s", CHANGES_JSON_URL)
+    data = mirror.load()
+    if data is None:
         return _empty_page()
-    entry = raw.get(day.isoformat())
+    entry = (data.get("days") or {}).get(day.isoformat()) or data.get(day.isoformat())
     if not entry:
         return _empty_page()
     return _page_from_json(entry)

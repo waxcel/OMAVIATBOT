@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 
-from config import CHANGES_URL, TIMEZONE, TIMETABLE_URL_TEMPLATE, WEEK1_START, WEEK_TTL
+import http_client
+from config import CHANGES_JSON_URL, CHANGES_URL, TIMEZONE, TIMETABLE_URL_TEMPLATE, WEEK1_START, WEEK_TTL
 from utils import norm
 
 _cache: dict[str, tuple[float, object]] = {}
@@ -37,7 +38,7 @@ def _week_number_from_page(day: date) -> tuple[int, date] | None:
     """Fetch changes page for a date (static HTML, no JS) and parse 'N учебная неделя'."""
     url = f"{CHANGES_URL}/{day.strftime('%d.%m.%Y')}"
     try:
-        resp = requests.get(url, timeout=20)
+        resp = http_client.get(url, timeout=20)
         resp.raise_for_status()
     except requests.RequestException:
         return None
@@ -88,6 +89,15 @@ def week_parity_for(day: date) -> int:
 
 
 def _week_parity_impl(day: date) -> int:
+    import mirror
+    if CHANGES_JSON_URL:
+        data = mirror.load()
+        week = (data or {}).get("weeks", {}).get(day.isoformat()) if isinstance(data, dict) else None
+        if isinstance(week, int) and week in (1, 2):
+            return week
+        # В зеркальном режиме напрямую на oat.ru не ходим — сайт блокирует датацентры
+        return _parity_from_reference(day)
+
     result = _week_number_from_page(day)
     if result:
         week, parsed_day = result

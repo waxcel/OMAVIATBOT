@@ -19,6 +19,10 @@ CHANGES_URL = "https://www.oat.ru/timetable/Changes/b1"
 # Если пуст — изменения рендерятся локально через Playwright.
 CHANGES_JSON_URL = os.getenv("CHANGES_JSON_URL", "")
 
+# Прокси для доступа к oat.ru (формат http://user:pass@host:port или socks5://host:port).
+# Нужен, когда сайт блокирует IP датацентра сервера. Применяется только к запросам на oat.ru.
+CHANGES_PROXY = os.getenv("CHANGES_PROXY", "")
+
 TIMEZONE = "Asia/Omsk"
 
 WEEK1_START = (2026, 8, 31)
@@ -27,6 +31,13 @@ TIMETABLE_TTL = 6 * 3600
 CHANGES_TTL = 10 * 60
 WEEK_TTL = 3600
 VIEW_TTL = 10 * 60
+
+# Таймаут и ретраи загрузки страницы изменений в браузере
+GOTO_TIMEOUT_MS = 90_000
+GOTO_RETRIES = 2
+
+# Явно привязывать oat.ru к IPv4 в Chromium (обход зависаний на IPv6)
+CHROMIUM_FORCE_IPV4 = True
 
 # Режим звонков (официальный, из колледжа)
 # Все дни, кроме четверга

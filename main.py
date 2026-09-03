@@ -20,8 +20,9 @@ from aiogram.types import (
 )
 
 import notifications
+import changes
 import service
-from config import BOT_TOKEN, WATERMARK
+from config import BOT_TOKEN, CHANGES_JSON_URL, WATERMARK
 from week import today
 
 logging.basicConfig(
@@ -137,6 +138,20 @@ async def fallback(message: Message) -> None:
 
 
 async def main() -> None:
+    if not CHANGES_JSON_URL:
+        loop = asyncio.get_running_loop()
+        ok, details = await loop.run_in_executor(None, changes.probe_site)
+        if ok:
+            logger.info("Проверка сети: oat.ru доступен (%s)", details)
+        else:
+            logger.error("Проверка сети: oat.ru НЕДОСТУПЕН с этого сервера (%s). "
+                         "Похоже, сайт не работает из датацентра — тогда нужен лёгкий режим "
+                         "(CHANGES_JSON_URL) или сервер с IP из России.", details)
+
+        ready = await loop.run_in_executor(None, changes.ensure_browser_installed)
+        if not ready:
+            logger.error("Chromium недоступен: изменения на сервере собираться не будут. "
+                         "Проверь логи выше или задай CHANGES_JSON_URL для лёгкого режима.")
     asyncio.create_task(notifications.scheduler(bot))
     await dp.start_polling(bot)
 
