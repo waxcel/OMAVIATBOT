@@ -1,0 +1,5 @@
+aiogram>=3.31
+requests
+beautifulsoup4
+playwright>=1.62
+tzdata
