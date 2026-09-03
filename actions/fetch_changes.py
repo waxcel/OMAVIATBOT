@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -21,7 +22,16 @@ DAYS_AHEAD = 7
 
 
 def render(page, url: str, max_wait: float = 25.0, min_wait: float = 6.0, stability_window: float = 1.5) -> str:
-    page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    try:
+        page.goto(url, wait_until="commit", timeout=25000)
+    except Exception as e:
+        print(f"Playwright error for {url}: {e}, trying requests...")
+        try:
+            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            r.encoding = r.apparent_encoding or "utf-8"
+            return r.text
+        except Exception:
+            return ""
 
     def snapshot() -> str:
         return page.evaluate(
@@ -56,10 +66,27 @@ def main() -> None:
     start = datetime.now(tz).date()
     days = [start + timedelta(days=i) for i in range(DAYS_AHEAD)]
 
-    resp = requests.get(TIMETABLE_URL_TEMPLATE.format(group=GROUP), timeout=60)
-    resp.raise_for_status()
-    schedule = _parse_schedule(resp.text)
-    print("Основное расписание: недели", sorted(schedule.keys()))
+    # Получение расписания
+    group_encoded = urllib.parse.quote(GROUP)
+    tt_url = TIMETABLE_URL_TEMPLATE.format(group=group_encoded)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+    
+    schedule = {}
+    try:
+        resp = requests.get(tt_url, headers=headers, timeout=20)
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        if resp.status_code == 200:
+            schedule = _parse_schedule(resp.text)
+            print("Основное расписание: недели", sorted(schedule.keys()))
+        else:
+            print(f"Warning: сайт вернул статус {resp.status_code}")
+    except Exception as e:
+        print(f"Warning: could not fetch base timetable: {e}")
 
     days_data: dict[str, dict] = {}
     with sync_playwright() as p:
@@ -67,7 +94,8 @@ def main() -> None:
         page = browser.new_page()
         for day in days:
             url = f"{CHANGES_URL}/{day.strftime('%d.%m.%Y')}"
-            parsed = _parse_changes(render(page, url))
+            html_content = render(page, url)
+            parsed = _parse_changes(html_content)
             days_data[day.isoformat()] = {
                 "changes": [asdict(c) for c in parsed.changes],
                 "bell_times": {str(k): list(v) for k, v in parsed.bell_times.items()},
