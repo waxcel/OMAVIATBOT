@@ -17,8 +17,22 @@ from config import CHANGES_URL, TIMEZONE
 DAYS_AHEAD = 7
 
 
-def render(page, url: str, max_wait: float = 25.0, min_wait: float = 6.0, stability_window: float = 1.5) -> str:
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+def render(page, url):
+    try:
+        page.goto(url, wait_until="commit", timeout=20000)
+        return page.content()
+    except Exception as e:
+        print(f"Playwright error for {url}: {e}, trying requests fallback...")
+        import requests
+        try:
+            resp = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            })
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            return resp.text
+        except Exception as req_err:
+            print(f"Requests fallback failed: {req_err}")
+            return ""
 
     def snapshot() -> str:
         return page.evaluate(
