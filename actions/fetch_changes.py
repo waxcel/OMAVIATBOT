@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import asdict
@@ -27,6 +28,35 @@ HEADERS = {
 }
 
 
+def count_lessons(schedule: dict) -> int:
+    return sum(
+        len(lessons)
+        for days_map in schedule.values()
+        for pairs in days_map.values()
+        for lessons in pairs.values()
+    )
+
+
+def debug_html(tag: str, html: str) -> None:
+    compact = re.sub(r"\s+", " ", html[:600]).strip()
+    title = re.search(r"<title>(.*?)</title>", html, re.S)
+    print(f"ОТЛАДКА [{tag}]: {len(html)} символов, title={title.group(1).strip()[:100] if title else 'нет'}")
+    print(f"ОТЛАДКА [{tag}] начало: {compact[:400]}")
+
+
+def decode_response(resp: requests.Response) -> str:
+    for enc in dict.fromkeys([resp.encoding, "utf-8", "windows-1251"]):
+        if not enc:
+            continue
+        try:
+            text = resp.content.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if "Понедельник" in text or "расписание" in text.lower():
+            return text
+    return resp.text
+
+
 def render(page, url: str, max_wait: float = 25.0, min_wait: float = 6.0, stability_window: float = 1.5) -> str:
     last_error: Exception | None = None
     for attempt in range(1, 4):
@@ -43,9 +73,8 @@ def render(page, url: str, max_wait: float = 25.0, min_wait: float = 6.0, stabil
         print(f"Playwright error for {url}: {last_error}, trying requests...")
         try:
             r = requests.get(url, timeout=20, headers=HEADERS)
-            r.encoding = r.apparent_encoding or "utf-8"
             r.raise_for_status()
-            return r.text
+            return decode_response(r)
         except Exception:
             return ""
 
@@ -71,20 +100,23 @@ def render(page, url: str, max_wait: float = 25.0, min_wait: float = 6.0, stabil
     return page.content()
 
 
-def fetch_schedule_html(url: str) -> str:
-    last_error = ""
+def fetch_schedule_requests(url: str) -> str | None:
     for attempt in range(1, 4):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=(15, 30))
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            if resp.status_code == 200 and len(resp.text) > 10_000:
-                return resp.text
-            last_error = f"HTTP {resp.status_code}, {len(resp.text)} байт"
+            if resp.status_code == 200:
+                text = decode_response(resp)
+                print(f"Расписание (requests): HTTP 200, {len(text)} символов")
+                return text
+            print(f"Расписание: попытка {attempt}/3 — HTTP {resp.status_code}")
         except Exception as e:
-            last_error = str(e)[:150]
-        print(f"Расписание: попытка {attempt}/3 не удалась ({last_error})")
+            print(f"Расписание: попытка {attempt}/3 не удалась: {str(e)[:150]}")
         time.sleep(4 * attempt)
-    print("Расписание: requests не помог, пробую через браузер...")
+    return None
+
+
+def fetch_schedule_browser(url: str) -> str | None:
+    print("Расписание: пробую через браузер...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -92,6 +124,24 @@ def fetch_schedule_html(url: str) -> str:
             return render(page, url)
         finally:
             browser.close()
+
+
+def get_schedule(url: str) -> dict:
+    html = fetch_schedule_requests(url)
+    schedule = _parse_schedule(html) if html else {}
+    if count_lessons(schedule) > 0:
+        return schedule
+
+    if html:
+        debug_html("расписание requests", html)
+    html2 = fetch_schedule_browser(url)
+    if html2:
+        schedule = _parse_schedule(html2)
+        if count_lessons(schedule) > 0:
+            return schedule
+        debug_html("расписание браузер", html2)
+    print("ОТЛАДКА: 'Понедельник-1' в requests-странице:", bool(html) and "Понедельник-1" in html)
+    return {}
 
 
 def main() -> None:
@@ -106,23 +156,12 @@ def main() -> None:
     days = [start + timedelta(days=i) for i in range(DAYS_AHEAD)]
 
     tt_url = TIMETABLE_URL_TEMPLATE.format(group=quote(GROUP))
-    schedule = {}
-    try:
-        html = fetch_schedule_html(tt_url)
-        schedule = _parse_schedule(html)
-        print("Основное расписание: недели", sorted(schedule.keys()))
-    except Exception as e:
-        print(f"Не удалось получить страницу расписания: {e}")
+    schedule = get_schedule(tt_url)
+    print("Основное расписание: недели", sorted(k for k, v in schedule.items() if v))
 
-    total_lessons = sum(
-        len(lessons)
-        for days_map in schedule.values()
-        for pairs in days_map.values()
-        for lessons in pairs.values()
-    )
-    if total_lessons == 0:
+    if count_lessons(schedule) == 0:
         print("ОШИБКА: расписание пустое — коммит отменён, чтобы бот не показывал «Пар нет». "
-              "Через 15 минут cron повторит попытку.")
+              "Через 15 минут cron повторит попытку. Смотри ОТЛАДКА-строки выше.")
         sys.exit(1)
 
     days_data: dict[str, dict] = {}
@@ -131,7 +170,10 @@ def main() -> None:
         page = browser.new_page()
         for day in days:
             url = f"{CHANGES_URL}/{day.strftime('%d.%m.%Y')}"
-            parsed = _parse_changes(render(page, url))
+            html_content = render(page, url)
+            if day is days[0]:
+                debug_html("страница изменений", html_content)
+            parsed = _parse_changes(html_content)
             days_data[day.isoformat()] = {
                 "changes": [asdict(c) for c in parsed.changes],
                 "bell_times": {str(k): list(v) for k, v in parsed.bell_times.items()},
@@ -165,7 +207,7 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     total = sum(len(v["changes"]) for v in days_data.values())
-    print(f"OK: {total} changes, {len(days_data)} days, {total_lessons} lessons, schedule x{len(schedule)} -> {out_path}")
+    print(f"OK: {total} changes, {len(days_data)} days, {count_lessons(schedule)} lessons, schedule x{len(schedule)} -> {out_path}")
 
 
 if __name__ == "__main__":
